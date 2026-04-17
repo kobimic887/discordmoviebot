@@ -1,0 +1,17 @@
+{
+  "name": "discordmovies",
+  "version": "1.0.0",
+  "description": "Discord bot that returns Vidking links from IMDb IDs",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "discord.js": "^14.18.0",
+    "dotenv": "^16.4.5"
+  }
+}
