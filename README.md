@@ -6,11 +6,14 @@ A Discord bot that resolves IMDb IDs and returns direct Vidking links for movies
 
 - Mention-based trigger (`@Bot tt0111161`)
 - Slash commands: `/stream`, `/popular`, `/help`
+- Slash commands: `/stream`, `/popular`, `/search`, `/random`, `/help`
 - IMDb parsing from full ID, plain digits, or IMDb URL text
 - IMDb -> TMDB resolution through `db.videasy.net`
 - Reply with direct Vidking embed URL + button + details embed
 - TV support (defaults to `S1E1`, or custom season/episode)
 - Popular feeds for movies, TV, and trending with IMDb enrichment
+- Title search command with direct stream links
+- Random picker command for quick watch suggestions
 - Basic per-user cooldown to reduce spam
 - In-memory caching for faster responses and fewer upstream API calls
 
@@ -89,6 +92,8 @@ Slash commands:
 - `/popular type:movie limit:5`
 - `/popular type:tv limit:5`
 - `/popular type:trending limit:10`
+- `/search query:inception type:movie limit:5`
+- `/random type:trending`
 - `/help`
 
 The bot replies with direct links like:
