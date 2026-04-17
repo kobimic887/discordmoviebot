@@ -25,6 +25,9 @@ const IMDB_URL_REGEX = /imdb\.com\/title\/(tt\d{7,10})/i;
 const DEFAULT_TV_SEASON = 1;
 const DEFAULT_TV_EPISODE = 1;
 const DEFAULT_POPULAR_LIMIT = 5;
+const DEFAULT_SEARCH_LIMIT = 5;
+const DEFAULT_RANDOM_POOL_LIMIT = 10;
+const MAX_RANDOM_PAGE = 20;
 
 const COOLDOWN_MS = 3000;
 const REQUEST_TIMEOUT_MS = 12000;
@@ -111,6 +114,62 @@ const slashCommands = [
         .setDescription("Result page (default 1)")
         .setMinValue(1)
         .setMaxValue(500)
+    ),
+  new SlashCommandBuilder()
+    .setName("search")
+    .setDescription("Search movies or TV shows and get stream links")
+    .addStringOption((option) =>
+      option
+        .setName("query")
+        .setDescription("Movie or TV title")
+        .setRequired(true)
+    )
+    .addStringOption((option) =>
+      option
+        .setName("type")
+        .setDescription("Search scope")
+        .addChoices(
+          { name: "Movies", value: "movie" },
+          { name: "TV Shows", value: "tv" },
+          { name: "Mixed", value: "multi" }
+        )
+    )
+    .addIntegerOption((option) =>
+      option
+        .setName("limit")
+        .setDescription("How many results to show (1-10, default 5)")
+        .setMinValue(1)
+        .setMaxValue(10)
+    )
+    .addIntegerOption((option) =>
+      option
+        .setName("page")
+        .setDescription("Result page (default 1)")
+        .setMinValue(1)
+        .setMaxValue(500)
+    )
+    .addBooleanOption((option) =>
+      option
+        .setName("autoplay")
+        .setDescription("Append autoPlay=true to generated links")
+    ),
+  new SlashCommandBuilder()
+    .setName("random")
+    .setDescription("Pick a random movie/TV stream link")
+    .addStringOption((option) =>
+      option
+        .setName("type")
+        .setDescription("Pick source")
+        .addChoices(
+          { name: "Movies", value: "movie" },
+          { name: "TV Shows", value: "tv" },
+          { name: "Trending", value: "trending" }
+        )
+    )
+    .addBooleanOption((option) =>
+      option
+        .setName("autoplay")
+        .setDescription("Append autoPlay=true to generated links")
     ),
   new SlashCommandBuilder()
     .setName("help")
@@ -279,6 +338,14 @@ function getPopularEndpoint(type, page) {
   return `${API_BASE_URL}/trending/all/day?language=en-US&page=${safePage}`;
 }
 
+function getSearchEndpoint(type, page, query) {
+  const safePage = Number.isInteger(page) && page > 0 ? page : 1;
+  const encodedQuery = encodeURIComponent(query);
+  const safeType = type === "movie" || type === "tv" ? type : "multi";
+
+  return `${API_BASE_URL}/search/${safeType}?query=${encodedQuery}&language=en-US&page=${safePage}&include_adult=false`;
+}
+
 async function fetchPopular(type, page) {
   const cacheKey = `popular:${type}:${page}`;
   const cachedValue = cacheGet(cacheKey);
@@ -287,6 +354,19 @@ async function fetchPopular(type, page) {
   }
 
   const result = await fetchJson(getPopularEndpoint(type, page));
+  cacheSet(cacheKey, result, CACHE_TTL_MS);
+  return result;
+}
+
+async function fetchSearch(type, query, page) {
+  const cacheKey = `search:${type}:${page}:${query.toLowerCase()}`;
+  const cachedValue = cacheGet(cacheKey);
+  if (cachedValue) {
+    return cachedValue;
+  }
+
+  const endpoint = getSearchEndpoint(type, page, query);
+  const result = await fetchJson(endpoint);
   cacheSet(cacheKey, result, CACHE_TTL_MS);
   return result;
 }
@@ -514,6 +594,41 @@ function normalizePopularItem(item, fallbackType) {
   };
 }
 
+function normalizeSearchItem(item, fallbackType) {
+  const mediaType = item.media_type || fallbackType;
+  if (mediaType !== "movie" && mediaType !== "tv") {
+    return null;
+  }
+
+  if (!item.id) {
+    return null;
+  }
+
+  const title =
+    mediaType === "movie"
+      ? item.title || item.original_title
+      : item.name || item.original_name;
+
+  if (!title) {
+    return null;
+  }
+
+  const date = mediaType === "movie" ? item.release_date : item.first_air_date;
+  const rating =
+    typeof item.vote_average === "number" && Number.isFinite(item.vote_average)
+      ? item.vote_average
+      : null;
+
+  return {
+    mediaType,
+    tmdbId: item.id,
+    title,
+    year: yearFromDate(date),
+    voteAverage: rating,
+    posterPath: item.poster_path || null,
+  };
+}
+
 async function buildPopularEntries(type, limit, page) {
   const raw = await fetchPopular(type, page);
   const rawResults = Array.isArray(raw.results) ? raw.results : [];
@@ -542,6 +657,34 @@ async function buildPopularEntries(type, limit, page) {
   );
 }
 
+async function buildSearchEntries(type, query, limit, page, autoPlay) {
+  const raw = await fetchSearch(type, query, page);
+  const rawResults = Array.isArray(raw.results) ? raw.results : [];
+  const fallbackType = type === "movie" || type === "tv" ? type : null;
+
+  const normalized = rawResults
+    .map((item) => normalizeSearchItem(item, fallbackType))
+    .filter(Boolean)
+    .slice(0, limit);
+
+  return Promise.all(
+    normalized.map(async (item) => {
+      const imdbId = await fetchImdbForTmdb(item.mediaType, item.tmdbId);
+      return {
+        ...item,
+        imdbId,
+        streamUrl: buildVidkingUrl({
+          mediaType: item.mediaType,
+          tmdbId: item.tmdbId,
+          season: DEFAULT_TV_SEASON,
+          episode: DEFAULT_TV_EPISODE,
+          autoPlay,
+        }),
+      };
+    })
+  );
+}
+
 function getPopularTitle(type) {
   if (type === "movie") {
     return "Popular Movies";
@@ -550,6 +693,16 @@ function getPopularTitle(type) {
     return "Popular TV Shows";
   }
   return "Trending Picks";
+}
+
+function getSearchTitle(type, query) {
+  if (type === "movie") {
+    return `Movie Search: ${query}`;
+  }
+  if (type === "tv") {
+    return `TV Search: ${query}`;
+  }
+  return `Search: ${query}`;
 }
 
 function buildPopularEmbed(type, page, entries) {
@@ -586,6 +739,34 @@ function buildPopularEmbed(type, page, entries) {
   return embed;
 }
 
+function buildSearchEmbed(type, query, page, entries) {
+  const lines = entries.map((entry, index) => {
+    const typeLabel = entry.mediaType === "tv" ? "TV" : "Movie";
+    const imdbPart = entry.imdbId ? `IMDb: \`${entry.imdbId}\`` : "IMDb: `N/A`";
+    const ratingPart =
+      typeof entry.voteAverage === "number"
+        ? ` | Rating: ${entry.voteAverage.toFixed(1)}`
+        : "";
+    const tvHint = entry.mediaType === "tv" ? " (S1E1 default)" : "";
+
+    return `${index + 1}. **${entry.title} (${entry.year})** - ${typeLabel}${ratingPart}\n${imdbPart} | [Open](${entry.streamUrl})${tvHint}`;
+  });
+
+  let description = "";
+  for (const line of lines) {
+    if ((description + line).length > 3900) {
+      break;
+    }
+    description += description ? `\n\n${line}` : line;
+  }
+
+  return new EmbedBuilder()
+    .setTitle(`${getSearchTitle(type, query)} - Page ${page}`)
+    .setDescription(description || "No displayable results.")
+    .setColor(0x9b59b6)
+    .setFooter({ text: "Use /stream for exact IMDb targeting" });
+}
+
 function getUsageText() {
   return [
     "Use one of these:",
@@ -594,6 +775,8 @@ function getUsageText() {
     "- Slash: `/stream imdb:tt0111161`",
     "- Slash TV: `/stream imdb:tt0944947 type:tv season:1 episode:1`",
     "- Popular: `/popular type:movie`",
+    "- Search: `/search query:inception type:movie`",
+    "- Random: `/random type:trending`",
   ].join("\n");
 }
 
@@ -755,6 +938,180 @@ async function handlePopularSlash(interaction) {
   }
 }
 
+async function handleSearchSlash(interaction) {
+  const cooldownRemainingMs = consumeCooldown(interaction.user.id);
+  if (cooldownRemainingMs > 0) {
+    await interaction.reply({
+      content: "Hold up a second and try again.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.deferReply();
+
+  const query = interaction.options.getString("query", true).trim();
+  if (!query) {
+    await interaction.editReply("Search query cannot be empty.");
+    return;
+  }
+
+  const type = interaction.options.getString("type") || "multi";
+  const limit = interaction.options.getInteger("limit") || DEFAULT_SEARCH_LIMIT;
+  const page = interaction.options.getInteger("page") || 1;
+  const autoPlayInput = interaction.options.getBoolean("autoplay");
+  const autoPlay = autoPlayInput !== false;
+
+  try {
+    const entries = await buildSearchEntries(type, query, limit, page, autoPlay);
+    if (entries.length === 0) {
+      await interaction.editReply("No results found for that search.");
+      return;
+    }
+
+    const embed = buildSearchEmbed(type, query, page, entries);
+    await interaction.editReply({ embeds: [embed] });
+  } catch (error) {
+    console.error(error);
+    await interaction.editReply(
+      "I could not fetch search results right now. Try again in a moment."
+    );
+  }
+}
+
+function randomInteger(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+async function pickRandomEntry(type, autoPlay) {
+  const selectedType = type || "trending";
+
+  if (selectedType === "movie" || selectedType === "tv") {
+    const randomPage = randomInteger(1, MAX_RANDOM_PAGE);
+    const entries = await buildPopularEntries(
+      selectedType,
+      DEFAULT_RANDOM_POOL_LIMIT,
+      randomPage
+    );
+
+    if (entries.length === 0) {
+      return null;
+    }
+
+    const picked = entries[randomInteger(0, entries.length - 1)];
+    return {
+      ...picked,
+      streamUrl: buildVidkingUrl({
+        mediaType: picked.mediaType,
+        tmdbId: picked.tmdbId,
+        season: DEFAULT_TV_SEASON,
+        episode: DEFAULT_TV_EPISODE,
+        autoPlay,
+      }),
+      sourceType: selectedType,
+      sourcePage: randomPage,
+    };
+  }
+
+  const randomPage = randomInteger(1, MAX_RANDOM_PAGE);
+  const entries = await buildPopularEntries(
+    "trending",
+    DEFAULT_RANDOM_POOL_LIMIT,
+    randomPage
+  );
+
+  if (entries.length === 0) {
+    return null;
+  }
+
+  const picked = entries[randomInteger(0, entries.length - 1)];
+  return {
+    ...picked,
+    streamUrl: buildVidkingUrl({
+      mediaType: picked.mediaType,
+      tmdbId: picked.tmdbId,
+      season: DEFAULT_TV_SEASON,
+      episode: DEFAULT_TV_EPISODE,
+      autoPlay,
+    }),
+    sourceType: "trending",
+    sourcePage: randomPage,
+  };
+}
+
+function buildRandomEmbed(entry) {
+  const typeLabel = entry.mediaType === "tv" ? "TV" : "Movie";
+  const imdbPart = entry.imdbId ? `IMDb: \`${entry.imdbId}\`` : "IMDb: `N/A`";
+  const ratingPart =
+    typeof entry.voteAverage === "number"
+      ? `Rating: **${entry.voteAverage.toFixed(1)}**`
+      : "Rating: **N/A**";
+  const tvHint = entry.mediaType === "tv" ? "\nEpisode: **S1E1 (default)**" : "";
+
+  const embed = new EmbedBuilder()
+    .setTitle(`Random Pick: ${entry.title} (${entry.year})`)
+    .setDescription(
+      [
+        `Type: **${typeLabel}**`,
+        ratingPart,
+        imdbPart,
+        `TMDB: \`${entry.tmdbId}\``,
+        `Source: **${entry.sourceType} page ${entry.sourcePage}**${tvHint}`,
+      ].join("\n")
+    )
+    .setColor(0xe67e22)
+    .setFooter({ text: "Use /search or /stream for specific picks" });
+
+  if (entry.posterPath) {
+    embed.setThumbnail(`${TMDB_IMAGE_BASE_URL}${entry.posterPath}`);
+  }
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setLabel("Open in Vidking")
+      .setStyle(ButtonStyle.Link)
+      .setURL(entry.streamUrl)
+  );
+
+  return {
+    content: entry.streamUrl,
+    embeds: [embed],
+    components: [row],
+  };
+}
+
+async function handleRandomSlash(interaction) {
+  const cooldownRemainingMs = consumeCooldown(interaction.user.id);
+  if (cooldownRemainingMs > 0) {
+    await interaction.reply({
+      content: "Hold up a second and try again.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.deferReply();
+
+  const type = interaction.options.getString("type") || "trending";
+  const autoPlayInput = interaction.options.getBoolean("autoplay");
+  const autoPlay = autoPlayInput !== false;
+
+  try {
+    const entry = await pickRandomEntry(type, autoPlay);
+    if (!entry) {
+      await interaction.editReply("Could not pick a random title right now.");
+      return;
+    }
+
+    await interaction.editReply(buildRandomEmbed(entry));
+  } catch (error) {
+    console.error(error);
+    await interaction.editReply(
+      "I could not fetch a random title right now. Try again in a moment."
+    );
+  }
+}
+
 async function handleHelpSlash(interaction) {
   const embed = new EmbedBuilder()
     .setTitle("DiscordMovieBot Help")
@@ -768,6 +1125,12 @@ async function handleHelpSlash(interaction) {
         "**/popular** - Show popular movies/TV/trending",
         "`/popular type:movie limit:5`",
         "`/popular type:trending limit:10`",
+        "",
+        "**/search** - Search by title and get playable links",
+        "`/search query:inception type:movie limit:5`",
+        "",
+        "**/random** - Grab a random pick",
+        "`/random type:trending`",
         "",
         "Mention command still works: `@bot tt0111161`",
       ].join("\n")
@@ -803,6 +1166,16 @@ client.on("interactionCreate", async (interaction) => {
 
   if (interaction.commandName === "popular") {
     await handlePopularSlash(interaction);
+    return;
+  }
+
+  if (interaction.commandName === "search") {
+    await handleSearchSlash(interaction);
+    return;
+  }
+
+  if (interaction.commandName === "random") {
+    await handleRandomSlash(interaction);
     return;
   }
 
