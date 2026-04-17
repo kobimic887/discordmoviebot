@@ -1,0 +1,7 @@
+services:
+  bot:
+    build: .
+    container_name: discordmoviebot
+    restart: unless-stopped
+    environment:
+      DISCORD_TOKEN: ${DISCORD_TOKEN}
